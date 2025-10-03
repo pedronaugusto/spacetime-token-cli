@@ -47,11 +47,11 @@ enum Commands {
     /// Saves the current active token from cli.toml to a new profile name
     Save(SaveArgs),
     /// Resets (clears) the profiles.toml file
-    Reset,
+    Reset(ResetArgs),
     /// Creates a new profile via 'spacetime login' and saves the token
     Create(CreateArgs),
     /// Lists all stored profile names
-    List,
+    List(ListArgs),
     /// Deletes a stored profile
     Delete(DeleteArgs),
     /// Interactive setup for configuration values
@@ -62,14 +62,21 @@ enum Commands {
     Current,
     /// Switches to the admin profile
     Admin,
+    /// Displays the current environment (server address)
+    Env,
+    /// Updates the address of an existing profile
+    SetAddress(SetAddressArgs),
 }
 
 #[derive(Parser, Debug)]
 struct SetArgs {
     /// The profile name to save/update
-    profile_name: String, // Renamed
+    profile_name: String,
     /// The token to associate with the profile name
     token: String,
+    /// The server address (e.g., 'local' or 'http://remote.host/spacetime')
+    #[clap(long)]
+    address: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -87,17 +94,51 @@ struct SaveArgs {
 #[derive(Parser, Debug)]
 struct CreateArgs {
     /// The profile name for the new profile
-    profile_name: String, // Renamed
+    profile_name: String,
+    /// The server address (e.g., 'local' or 'http://remote.host/spacetime')
+    #[clap(long)]
+    address: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+struct ListArgs {
+    /// Only show profiles for the current environment
+    #[clap(long)]
+    env: bool,
 }
 
 #[derive(Parser, Debug)]
 struct DeleteArgs {
     /// The profile name of the profile to delete
-    profile_name: String, // Renamed
+    profile_name: String,
+    /// Forces deletion without confirmation
+    #[clap(long, short)]
+    force: bool,
+}
+
+#[derive(Parser, Debug)]
+struct ResetArgs {
+    /// Forces reset without confirmation
+    #[clap(long, short)]
+    force: bool,
+}
+
+#[derive(Parser, Debug)]
+struct SetAddressArgs {
+    /// The profile name to update
+    profile_name: String,
+    /// The new server address
+    address: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Profile {
+    token: String,
+    address: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
-struct UserProfiles(HashMap<String, String>); // Renamed
+struct UserProfiles(HashMap<String, Profile>);
 
 fn get_app_config_dir() -> Result<PathBuf> {
     let config_dir = dirs::config_dir()
@@ -160,32 +201,67 @@ fn get_cli_toml_path(settings: &AppSettings) -> Result<PathBuf> {
 }
 
 fn read_profiles(settings: &AppSettings) -> Result<UserProfiles> {
-    // Renamed function and return type
-    let profiles_path = get_profiles_filepath(settings)?; // Renamed variable
+    let profiles_path = get_profiles_filepath(settings)?;
     if !profiles_path.exists() {
-        match fs::write(&profiles_path, "") {
-            // Renamed variable
-            Ok(_) => println!("Created empty {}.", settings.profiles_filename), // Renamed field
-            Err(e) => {
-                return Err(anyhow::Error::new(e).context(format!(
-                    "Failed to create empty profiles file at {:?}", // Renamed
-                    profiles_path                                   // Renamed variable
-                )));
+        fs::write(&profiles_path, "").with_context(|| {
+            format!(
+                "Failed to create empty profiles file at {:?}",
+                profiles_path
+            )
+        })?;
+        println!("Created empty {}.", settings.profiles_filename);
+        return Ok(UserProfiles::default());
+    }
+
+    let content = fs::read_to_string(&profiles_path)
+        .with_context(|| format!("Failed to read profiles file at {:?}", profiles_path))?;
+    if content.trim().is_empty() {
+        return Ok(UserProfiles::default());
+    }
+
+    // Try parsing new format first
+    match toml::from_str::<UserProfiles>(&content) {
+        Ok(profiles) => Ok(profiles),
+        Err(e) => {
+            // If it fails, try parsing the old format and migrating
+            println!(
+                "Could not parse profiles file. Assuming old format and attempting migration..."
+            );
+
+            #[derive(Deserialize)]
+            struct OldUserProfiles(HashMap<String, String>);
+
+            match toml::from_str::<OldUserProfiles>(&content) {
+                Ok(old_profiles) => {
+                    let mut new_profiles = UserProfiles::default();
+                    for (name, token) in old_profiles.0 {
+                        new_profiles.0.insert(
+                            name,
+                            Profile {
+                                token,
+                                address: "local".to_string(),
+                            },
+                        );
+                    }
+                    // Write the migrated profiles back to the file
+                    write_profiles(settings, &new_profiles)
+                        .context("Failed to save migrated profiles file.")?;
+                    println!("Successfully migrated profiles to new format.");
+                    Ok(new_profiles)
+                }
+                Err(migration_err) => {
+                    println!(
+                        "Failed to parse profiles file as old format either: {}",
+                        migration_err
+                    );
+                    Err(anyhow::Error::new(e).context(format!(
+                        "Failed to parse profiles file at {:?}. It might be corrupted.",
+                        profiles_path
+                    )))
+                }
             }
         }
-        return Ok(UserProfiles::default()); // Renamed type
     }
-    let content = fs::read_to_string(&profiles_path) // Renamed variable
-        .with_context(|| format!("Failed to read profiles file at {:?}", profiles_path))?; // Renamed
-    if content.trim().is_empty() {
-        return Ok(UserProfiles::default()); // Renamed type
-    }
-    toml::from_str(&content).with_context(|| {
-        format!(
-            "Failed to parse profiles file at {:?}. Ensure it's valid TOML or empty.", // Renamed
-            profiles_path // Renamed variable
-        )
-    })
 }
 
 fn write_profiles(settings: &AppSettings, profiles: &UserProfiles) -> Result<()> {
@@ -225,6 +301,18 @@ fn write_cli_toml(settings: &AppSettings, doc: &DocumentMut) -> Result<()> {
     })?;
     println!("Successfully updated {}.", settings.cli_config_filename);
     Ok(())
+}
+
+fn get_current_environment(settings: &AppSettings) -> Result<Option<String>> {
+    let cli_toml_path = get_cli_toml_path(settings)?;
+    if !cli_toml_path.exists() {
+        return Ok(None);
+    }
+    let cli_toml = read_cli_toml(settings)?;
+    Ok(cli_toml
+        .get("default_host")
+        .and_then(|item| item.as_str())
+        .map(|s| s.to_string()))
 }
 
 fn run_external_command(command_name: &str, args: &[&str]) -> Result<()> {
@@ -275,15 +363,23 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Set(args) => {
-            let mut profiles = read_profiles(&settings)?; // Renamed
-            profiles // Renamed
+            let mut profiles = read_profiles(&settings)?;
+            let address = args.address.unwrap_or_else(|| {
+                get_current_environment(&settings)
+                    .unwrap_or_default()
+                    .unwrap_or_else(|| "local".to_string())
+            });
+            let profile = Profile {
+                token: args.token.clone(),
+                address,
+            };
+            profiles
                 .0
-                .insert(args.profile_name.clone(), args.token.clone()); // Renamed
-            write_profiles(&settings, &profiles)?; // Renamed
+                .insert(args.profile_name.clone(), profile.clone());
+            write_profiles(&settings, &profiles)?;
             println!(
-                "Profile '{}' saved/updated in {}.", // Renamed
-                args.profile_name,
-                settings.profiles_filename // Renamed
+                "Profile '{}' saved/updated in {}.",
+                args.profile_name, settings.profiles_filename
             );
 
             let cli_toml_path = get_cli_toml_path(&settings)?;
@@ -297,41 +393,49 @@ fn main() -> Result<()> {
                 DocumentMut::new()
             };
             cli_toml[&settings.cli_token_key] = Item::Value(args.token.into());
+            cli_toml["default_host"] = Item::Value(profile.address.into());
             write_cli_toml(&settings, &cli_toml)?;
             println!(
-                "Profile '{}' also set as active token in {}.", // Renamed
-                args.profile_name,
-                settings.cli_config_filename // Renamed
+                "Profile '{}' also set as active in {}.",
+                args.profile_name, settings.cli_config_filename
             );
         }
         Commands::Switch(args) => {
-            let profiles = read_profiles(&settings)?; // Renamed
+            let profiles = read_profiles(&settings)?;
             let profile_name_to_switch = match args.profile_name {
-                // Renamed
                 Some(name) => name,
                 None => {
-                    if profiles.0.is_empty() {
-                        // Renamed
-                        println!(
-                            "No profiles found in {}. Cannot switch.", // Renamed
-                            settings.profiles_filename                 // Renamed
-                        );
-                        anyhow::bail!("No profiles available to switch."); // Renamed
+                    let current_env = get_current_environment(&settings)
+                        .context("Failed to get current environment.")?;
+
+                    let mut filtered_profiles: HashMap<String, Profile> = profiles.0.clone();
+                    if let Some(env) = &current_env {
+                        println!("Current environment: {}", env);
+                        filtered_profiles.retain(|_, profile| &profile.address == env);
                     }
-                    let profile_names: Vec<&String> = profiles.0.keys().collect(); // Renamed
+
+                    if filtered_profiles.is_empty() {
+                        println!(
+                            "No profiles found for the current environment in {}. Cannot switch.",
+                            settings.profiles_filename
+                        );
+                        anyhow::bail!(
+                            "No profiles available to switch in the current environment."
+                        );
+                    }
+                    let profile_names: Vec<String> = filtered_profiles.keys().cloned().collect();
                     let selection = Select::with_theme(&ColorfulTheme::default())
-                        .with_prompt("Select profile to switch to") // Renamed
-                        .items(&profile_names) // Renamed
+                        .with_prompt("Select a profile to switch to")
+                        .items(&profile_names)
                         .default(0)
                         .interact_opt()?
-                        .context("No profile selected or selection cancelled.")?; // Renamed
+                        .context("No profile selected or selection cancelled.")?;
 
-                    profile_names[selection].clone() // Renamed
+                    profile_names[selection].clone()
                 }
             };
 
-            if let Some(token_from_profiles) = profiles.0.get(&profile_name_to_switch) {
-                // Renamed
+            if let Some(profile_to_switch) = profiles.0.get(&profile_name_to_switch) {
                 let cli_toml_path = get_cli_toml_path(&settings)?;
                 let mut cli_toml = if cli_toml_path.exists() {
                     read_cli_toml(&settings)?
@@ -343,12 +447,14 @@ fn main() -> Result<()> {
                     }
                     DocumentMut::new()
                 };
-                cli_toml[&settings.cli_token_key] = Item::Value(token_from_profiles.clone().into()); // Renamed
+                cli_toml[&settings.cli_token_key] =
+                    Item::Value(profile_to_switch.token.clone().into());
+                cli_toml["default_host"] = Item::Value(profile_to_switch.address.clone().into());
                 write_cli_toml(&settings, &cli_toml)?;
                 println!(
-                    "Switched active token to profile '{}' (from {}) in {}.", // Renamed
-                    profile_name_to_switch,                                   // Renamed
-                    settings.profiles_filename,                               // Renamed
+                    "Switched active profile to '{}' (from {}) in {}.",
+                    profile_name_to_switch,
+                    settings.profiles_filename,
                     settings.cli_config_filename
                 );
             } else {
@@ -363,10 +469,9 @@ fn main() -> Result<()> {
             }
         }
         Commands::Admin => {
-            let admin_profile_name = "admin".to_string(); // Renamed
-            let profiles = read_profiles(&settings)?; // Renamed
-            if let Some(token_from_profiles) = profiles.0.get(&admin_profile_name) {
-                // Renamed
+            let admin_profile_name = "admin".to_string();
+            let profiles = read_profiles(&settings)?;
+            if let Some(admin_profile) = profiles.0.get(&admin_profile_name) {
                 let cli_toml_path = get_cli_toml_path(&settings)?;
                 let mut cli_toml = if cli_toml_path.exists() {
                     read_cli_toml(&settings)?
@@ -378,13 +483,12 @@ fn main() -> Result<()> {
                     }
                     DocumentMut::new()
                 };
-                cli_toml[&settings.cli_token_key] = Item::Value(token_from_profiles.clone().into()); // Renamed
+                cli_toml[&settings.cli_token_key] = Item::Value(admin_profile.token.clone().into());
+                cli_toml["default_host"] = Item::Value(admin_profile.address.clone().into());
                 write_cli_toml(&settings, &cli_toml)?;
                 println!(
-                    "Switched active token to ADMIN profile '{}' (from {}) in {}.", // Renamed
-                    admin_profile_name,
-                    settings.profiles_filename,
-                    settings.cli_config_filename // Renamed
+                    "Switched active profile to ADMIN '{}' (from {}) in {}.",
+                    admin_profile_name, settings.profiles_filename, settings.cli_config_filename
                 );
             } else {
                 println!(
@@ -406,34 +510,43 @@ fn main() -> Result<()> {
             }
             let cli_toml = read_cli_toml(&settings)?;
 
-            let mut profiles = read_profiles(&settings)?; // Renamed
+            let mut profiles = read_profiles(&settings)?;
             if profiles.0.contains_key(&args.profile_name) {
-                // Renamed
                 anyhow::bail!("Profile '{}' already exists in {}. Use a different name or delete the existing one first.", args.profile_name, settings.profiles_filename);
-                // Renamed
             }
 
-            match cli_toml.get(&settings.cli_token_key) {
-                Some(token_item) => {
-                    if let Some(token_str) = token_item.as_str() {
-                        profiles // Renamed
-                            .0
-                            .insert(args.profile_name.clone(), token_str.to_string()); // Renamed
-                        write_profiles(&settings, &profiles)?; // Renamed
+            match (
+                cli_toml.get(&settings.cli_token_key),
+                cli_toml.get("default_host"),
+            ) {
+                (Some(token_item), Some(host_item)) => {
+                    if let (Some(token_str), Some(host_str)) =
+                        (token_item.as_str(), host_item.as_str())
+                    {
+                        let profile = Profile {
+                            token: token_str.to_string(),
+                            address: host_str.to_string(),
+                        };
+                        profiles.0.insert(args.profile_name.clone(), profile);
+                        write_profiles(&settings, &profiles)?;
                         println!(
-                            "Saved current active token as '{}' in {}.", // Renamed
-                            args.profile_name,
-                            settings.profiles_filename // Renamed
+                            "Saved current active session as profile '{}' in {}.",
+                            args.profile_name, settings.profiles_filename
                         );
                     } else {
                         anyhow::bail!(
-                            "Token key '{}' in {} is not a string.",
-                            settings.cli_token_key,
+                            "Token or host in {} are not strings.",
                             settings.cli_config_filename
                         );
                     }
                 }
-                None => {
+                (Some(_), None) => {
+                    anyhow::bail!(
+                        "'default_host' not found in {}. Cannot save profile.",
+                        settings.cli_config_filename
+                    );
+                }
+                (None, _) => {
                     anyhow::bail!(
                         "User is not logged in. Token key '{}' not found in {}.",
                         settings.cli_token_key,
@@ -442,10 +555,22 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Reset => {
-            let profiles = UserProfiles::default(); // Renamed
-            write_profiles(&settings, &profiles)?; // Renamed
-            println!("{} has been reset.", settings.profiles_filename); // Renamed
+        Commands::Reset(args) => {
+            if !args.force {
+                let confirmation = dialoguer::Confirm::new()
+                    .with_prompt(format!(
+                        "Are you sure you want to reset {}? This will delete all profiles.",
+                        settings.profiles_filename
+                    ))
+                    .interact()?;
+                if !confirmation {
+                    println!("Reset cancelled.");
+                    return Ok(());
+                }
+            }
+            let profiles = UserProfiles::default();
+            write_profiles(&settings, &profiles)?;
+            println!("{} has been reset.", settings.profiles_filename);
         }
         Commands::Create(args) => {
             let mut profiles = read_profiles(&settings)?; // Renamed
@@ -461,18 +586,25 @@ fn main() -> Result<()> {
             run_external_command(SPACETIME_CLI_COMMAND, &["logout"])
                 .context("Failed to logout from SpacetimeDB CLI.")?;
 
+            let address = args.address.unwrap_or_else(|| "local".to_string());
             println!(
-                "Please follow the prompts from 'spacetime login --server-issued-login local'."
+                "Please follow the prompts from 'spacetime login --server-issued-login {}'",
+                address
             );
             run_external_command(
                 SPACETIME_CLI_COMMAND,
-                &["login", "--server-issued-login", "local"],
+                &["login", "--server-issued-login", &address],
             )
-            .context("Failed during 'spacetime login --server-issued-login local'.")?;
+            .with_context(|| {
+                format!(
+                    "Failed during 'spacetime login --server-issued-login {}'",
+                    address
+                )
+            })?;
 
             println!(
                 "Login successful. Saving token as '{}'...",
-                args.profile_name // Renamed
+                args.profile_name
             );
             let cli_toml_path = get_cli_toml_path(&settings)?;
             if !cli_toml_path.exists() {
@@ -485,14 +617,15 @@ fn main() -> Result<()> {
             match cli_toml.get(&settings.cli_token_key) {
                 Some(token_item) => {
                     if let Some(token_str) = token_item.as_str() {
-                        profiles // Renamed
-                            .0
-                            .insert(args.profile_name.clone(), token_str.to_string()); // Renamed
-                        write_profiles(&settings, &profiles)?; // Renamed
+                        let new_profile = Profile {
+                            token: token_str.to_string(),
+                            address,
+                        };
+                        profiles.0.insert(args.profile_name.clone(), new_profile);
+                        write_profiles(&settings, &profiles)?;
                         println!(
-                            "Successfully created and saved profile '{}' in {}.", // Renamed
-                            args.profile_name,
-                            settings.profiles_filename // Renamed
+                            "Successfully created and saved profile '{}' in {}.",
+                            args.profile_name, settings.profiles_filename
                         );
                     } else {
                         anyhow::bail!(
@@ -511,9 +644,14 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::List => {
-            let profiles = read_profiles(&settings)?; // Renamed
+        Commands::List(args) => {
+            let profiles = read_profiles(&settings)?;
             let mut active_token_opt: Option<String> = None;
+            let current_env = if args.env {
+                get_current_environment(&settings).context("Failed to get current environment.")?
+            } else {
+                None
+            };
 
             if let Ok(cli_toml_path) = get_cli_toml_path(&settings) {
                 if cli_toml_path.exists() {
@@ -527,27 +665,30 @@ fn main() -> Result<()> {
                 }
             }
 
-            if profiles.0.is_empty() {
-                // Renamed
+            let mut profiles_to_display = profiles.0.clone();
+            if let Some(env) = &current_env {
+                println!("Current environment: {}", env);
+                profiles_to_display.retain(|_, profile| &profile.address == env);
+            }
+
+            if profiles_to_display.is_empty() {
                 println!("No profiles found in {}.", settings.profiles_filename);
-            // Renamed
             } else {
-                println!("Available profiles in {}:", settings.profiles_filename); // Renamed
-                let mut sorted_profile_names: Vec<_> = profiles.0.keys().collect(); // Renamed
-                sorted_profile_names.sort(); // Renamed
+                println!("Available profiles in {}:", settings.profiles_filename);
+                let mut sorted_profile_names: Vec<_> = profiles_to_display.keys().collect();
+                sorted_profile_names.sort();
 
                 for profile_name in sorted_profile_names {
-                    // Renamed
-                    let mut display_name = format!("- {}", profile_name); // Renamed
-                    if let Some(ref active_token) = active_token_opt {
-                        if let Some(user_token) = profiles.0.get(profile_name) {
-                            // Renamed
-                            if user_token == active_token {
+                    if let Some(profile) = profiles_to_display.get(profile_name) {
+                        let mut display_name =
+                            format!("- {} (address: {})", profile_name, profile.address);
+                        if let Some(ref active_token) = active_token_opt {
+                            if &profile.token == active_token {
                                 display_name.push_str(" (current)");
                             }
                         }
+                        println!("{}", display_name);
                     }
-                    println!("{}", display_name);
                 }
             }
         }
@@ -563,18 +704,18 @@ fn main() -> Result<()> {
             let cli_toml_doc = read_cli_toml(&settings)?;
             if let Some(token_item) = cli_toml_doc.get(&settings.cli_token_key) {
                 if let Some(active_token_str) = token_item.as_str() {
-                    let profiles = read_profiles(&settings)?; // Renamed
-                    let mut current_profile_name: Option<String> = None; // Renamed
-                    for (profile_name, token) in profiles.0.iter() {
-                        // Renamed
-                        if token == active_token_str {
-                            current_profile_name = Some(profile_name.clone()); // Renamed
+                    let profiles = read_profiles(&settings)?;
+                    let mut current_profile: Option<(String, Profile)> = None;
+                    for (profile_name, profile) in profiles.0.iter() {
+                        if profile.token == active_token_str {
+                            current_profile = Some((profile_name.clone(), profile.clone()));
                             break;
                         }
                     }
-                    if let Some(name) = current_profile_name {
-                        // Renamed
-                        println!("Current active profile: {}", name); // Renamed
+
+                    if let Some((name, profile)) = current_profile {
+                        println!("Current active profile: {}", name);
+                        println!("Address: {}", profile.address);
                     } else {
                         println!(
                             "Current active token is set, but not found under any profile name in {}.", // Renamed
@@ -596,22 +737,52 @@ fn main() -> Result<()> {
             }
         }
         Commands::Delete(args) => {
-            let mut profiles = read_profiles(&settings)?; // Renamed
-            if profiles.0.remove(&args.profile_name).is_some() {
-                // Renamed
-                write_profiles(&settings, &profiles)?; // Renamed
+            let mut profiles = read_profiles(&settings)?;
+            if !profiles.0.contains_key(&args.profile_name) {
                 println!(
-                    "Profile '{}' deleted from {}.", // Renamed
-                    args.profile_name,
-                    settings.profiles_filename // Renamed
+                    "Profile '{}' not found in {}. Nothing to delete.",
+                    args.profile_name, settings.profiles_filename
+                );
+                anyhow::bail!("Profile not found for deletion.");
+            }
+
+            if !args.force {
+                let confirmation = dialoguer::Confirm::new()
+                    .with_prompt(format!(
+                        "Are you sure you want to delete the profile '{}'?",
+                        args.profile_name
+                    ))
+                    .interact()?;
+                if !confirmation {
+                    println!("Deletion cancelled.");
+                    return Ok(());
+                }
+            }
+
+            if profiles.0.remove(&args.profile_name).is_some() {
+                write_profiles(&settings, &profiles)?;
+                println!(
+                    "Profile '{}' deleted from {}.",
+                    args.profile_name, settings.profiles_filename
+                );
+            }
+        }
+        Commands::Env => match get_current_environment(&settings) {
+            Ok(Some(env)) => println!("Current environment: {}", env),
+            Ok(None) => println!("Environment not set."),
+            Err(e) => anyhow::bail!("Failed to get current environment: {}", e),
+        },
+        Commands::SetAddress(args) => {
+            let mut profiles = read_profiles(&settings)?;
+            if let Some(profile) = profiles.0.get_mut(&args.profile_name) {
+                profile.address = args.address.clone();
+                write_profiles(&settings, &profiles)?;
+                println!(
+                    "Updated address for profile '{}' to '{}'.",
+                    args.profile_name, args.address
                 );
             } else {
-                println!(
-                    "Profile '{}' not found in {}. Nothing to delete.", // Renamed
-                    args.profile_name,
-                    settings.profiles_filename // Renamed
-                );
-                anyhow::bail!("Profile not found for deletion."); // Renamed
+                anyhow::bail!("Profile '{}' not found.", args.profile_name);
             }
         }
         Commands::Setup => {
