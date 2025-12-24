@@ -12,9 +12,10 @@ It can be invoked as `spacetime-token` or its alias `stt`.
 - **List Profiles**: Lists all profile names stored in `profiles.toml`.
 - **Delete Profile**: Removes a specified profile from `profiles.toml`.
 - **Reset Profiles**: Clears all profiles from `profiles.toml`.
-- **Switch Profile**: Switches the active token to a stored profile. If no profile name is provided, it interactively prompts for a selection from available profiles.
+- **Switch Profile**: Switches the active token to a stored profile. If no profile name is provided, it interactively prompts for a selection from available profiles, with optional filtering by environment.
 - **Admin Switch**: A dedicated command (`admin`) to quickly switch to a profile named "admin".
 - **Current Profile**: Displays the currently active token and its associated profile name, if any.
+- **Environment Management**: List environments derived from profiles and set the active environment (server address), optionally switching to a matching profile in one step.
 - **Setup**: Interactively configure tool settings.
 
 ## Configuration
@@ -108,12 +109,12 @@ This command always requires both a profile name and a token. It will update `sp
 #### 2. `switch` - Switch Active Profile
 
 Looks up `<PROFILE_NAME>` in `profiles.toml` and updates `cli.toml` to use its token, making it the active profile.
-If `<PROFILE_NAME>` is omitted, it will present an interactive menu to select from available profiles.
+If `<PROFILE_NAME>` is omitted, it will present an interactive menu to select from available profiles (all by default). Use `--address <addr>` to filter the menu to a specific environment.
 
 ```bash
-spacetime-token switch [PROFILE_NAME]
+spacetime-token switch [PROFILE_NAME] [--address <ADDR>]
 # or
-stt switch [PROFILE_NAME]
+stt switch [PROFILE_NAME] [--address <ADDR>]
 ```
 
 Example (direct switch):
@@ -128,6 +129,13 @@ Example (interactive switch):
 ```bash
 spacetime-token switch
 # (A menu will appear to select a profile)
+```
+
+Example (switch across environments):
+
+```bash
+spacetime-token switch --address http://staging.example.com/spacetime
+# Interactive selection limited to profiles pointing at that address
 ```
 
 #### 3. `save` - Save Current Token to a New Profile
@@ -151,7 +159,9 @@ This reads the `spacetimedb_token` from `~/.config/spacetime/cli.toml` and saves
 
 #### 4. `create` - Create New Profile via Login
 
-Guides you through `spacetime logout` and then `spacetime login --server-issued-login local`, then saves the newly acquired token to `profiles.toml` (in the config directory) under the provided profile name.
+For `local`, this guides you through `spacetime logout` and then `spacetime login --server-issued-login local`, then saves the newly acquired token to `profiles.toml` (in the config directory) under the provided profile name.
+
+For remote HTTPS hosts, the tool calls `<address>/v1/identity` directly to mint a server-issued token (avoids CLI login errors when the server requires a Content-Length header). When switching or creating a profile, the tool updates `default_server` to the profile name and keeps `server_configs` in sync with saved profiles.
 It will error if the chosen profile name already exists in `profiles.toml` _before_ starting the logout/login process.
 
 ```bash
@@ -170,7 +180,7 @@ This command requires the `spacetime` CLI to be installed and in your PATH.
 
 #### 5. `list` - List Profiles
 
-Lists all profile names currently stored in `profiles.toml`. Highlights the currently active profile by appending " (current)" if its token matches the one in `cli.toml`.
+Lists all profile names currently stored in `profiles.toml`. Highlights the currently active profile by appending " (current)" if its token matches the one in `cli.toml`. Use `--env` to show only profiles that match the current environment.
 
 ```bash
 spacetime-token list
@@ -256,3 +266,42 @@ stt admin
 ```
 
 If the "admin" profile does not exist in `profiles.toml`, an error will be reported.
+
+#### 11. `env` - Manage Environments
+
+Inspect or set the active environment (`default_host` in `cli.toml`) while switching to a matching profile. Environments cannot be changed unless a profile with that address is selected.
+
+Show current environment:
+
+```bash
+spacetime-token env
+# or
+spacetime-token env current
+```
+
+List environments discovered from saved profiles (with the current one highlighted):
+
+```bash
+spacetime-token env list
+```
+
+Set the environment and switch to a profile that uses that address:
+
+```bash
+spacetime-token env use <ADDRESS> [--profile <PROFILE_NAME>]
+# examples
+spacetime-token env use local
+spacetime-token env use https://prod.example.com/spacetime --profile admin
+```
+
+If multiple profiles share the chosen address, you will be prompted to pick one unless you specify `--profile`. If no profiles match the address, the command will error so you can create/point a profile first.
+
+#### 12. `set-address` - Update a Profile's Address
+
+Update the server address associated with a stored profile. This is useful if a server URL changes or if you want to repoint a profile to a different environment.
+
+```bash
+spacetime-token set-address <PROFILE_NAME> <ADDRESS>
+# or
+stt set-address <PROFILE_NAME> <ADDRESS>
+```
